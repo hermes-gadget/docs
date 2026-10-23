@@ -26,8 +26,9 @@ second lane stays invisible until a tag or a dispatch fires it.</figcaption>
 |---|---|
 | `gofmt -l` | any file not formatted |
 | `go vet` | the compiler's own suspicions |
-| `golangci-lint` + ratchet | any *increase* in findings - see below |
+| `golangci-lint` + ratchet | an increased per-linter count, incomplete lint or an invalid baseline |
 | `go test ./...` | a failing test, across four parallel shards |
+| GPU CPU twins | a compute entry point without a CPU function and comparison callback |
 | conflict markers | `<<<<<<<`, `=======` or `>>>>>>>` committed in source |
 | file length | over 500 lines without an exemption naming its reason |
 | tracked build artifacts | a compiled binary or coverage profile in the index |
@@ -47,14 +48,85 @@ Enabling the bug-class linters on an existing tree produces hundreds of
 findings at once. Turning those into a red build would mean hundreds of
 unreviewed changes in one commit, so the count is held at a baseline instead:
 
-```
-tools/lint-ratchet.sh            compare against the baseline
-tools/lint-ratchet.sh --update   rewrite it, after clearing something
+```bash
+tools/lint-ratchet.sh
 ```
 
-A **new** finding fails the pull request that introduces it. The backlog is
-cleared deliberately, one class at a time, and each clearing tightens
-`.golangci-baseline.txt` in the same commit as the fix that earned it.
+Run the command from a MeshBench source checkout. It invokes
+`golangci-lint run` and compares each linter's count against
+`.golangci-baseline.txt`. A linter absent from the baseline has an allowance
+of zero. An increased count fails even if another linter's count falls; an
+equal or lower count passes. This is a count check: replacing a finding with
+another from the same linter can leave the count unchanged.
+
+The script needs Bash and the source checkout's lint configuration. Running
+the documentation site's `python3 gen.py` checks the manual's links and
+anchors; it does not run the application's lint or GPU tests.
+
+The ratchet fails closed. Before it compares or writes counts, it requires:
+
+- A linter exit status of 0 for zero findings, or 1 for findings. A missing
+  executable, configuration error, timeout or crash is not a clean run.
+- Exactly one recognised total line, `N issues.` or `N issues:`, with a
+  non-negative integer in place of `N`.
+- Per-linter summary lines in the form `* gosec: 2`. Names start with a
+  lower-case letter and contain only lower-case letters and digits. Their
+  counts must sum to the total, and the total must agree with the exit status.
+
+In comparison mode, the baseline must also be readable. Each non-blank line
+contains a linter name in that same form and a non-negative integer count,
+separated by whitespace; duplicate names and extra fields fail. An empty
+baseline allows no findings.
+
+### Fix findings and tighten the baseline
+
+1. Use the version named by `GOLANGCI_LINT_VERSION` in
+   `.github/workflows/ci.yml` (v2.12.2). Different versions disagree about the
+   tree by tens of findings, so a baseline from another version is not a
+   meaningful comparison. `golangci-lint version` prints the installed version.
+2. Run `tools/lint-ratchet.sh`. Fix each increased count. A local
+   `//nolint` exception must name the linter and give the reason at the call
+   site; raising the allowance does not resolve the finding.
+3. After a successful comparison reports `fallen` or `cleared`, record the
+   lower counts, review the diff and check again:
+
+```bash
+tools/lint-ratchet.sh --update
+git diff -- .golangci-baseline.txt
+tools/lint-ratchet.sh
+```
+
+Commit the tightened baseline with the fixes that earn it. `--update` checks
+the lint run, then writes its counts directly: it neither validates nor
+compares the old baseline, and can therefore raise an allowance if used
+without the preceding comparison. Never use it to admit an increased count.
+A failed or unrecognised lint run leaves the baseline unchanged, including
+when `--update` is requested.
+
+`GOLANGCI_LINT` can select a different executable path; its value names one
+executable, not a command with extra arguments:
+
+```bash
+GOLANGCI_LINT=/path/to/golangci-lint tools/lint-ratchet.sh
+```
+
+### Ratchet messages
+
+The placeholders below stand for the linter name, counts and exit status.
+The spelling and capitalisation match the script.
+
+| message | meaning and action |
+|---|---|
+| `lint did not complete (exit <status>); baseline unchanged` | The linter exits with a status other than 0 or 1. Read the preceding tool output, restore the executable or fix the tool failure, then rerun. |
+| `unrecognised lint output; baseline unchanged` | There is no single recognised total, even if the linter exits successfully. Check the pinned version and the preceding output. |
+| `inconsistent lint summary; baseline unchanged` | Per-linter counts do not sum to the total, or the total disagrees with the exit status. Resolve the tool/output mismatch before updating. |
+| `invalid or missing lint baseline` | Comparison mode cannot read the baseline, or its rows are malformed or duplicated. Restore the tracked baseline or correct its format without widening it. |
+| `RISEN  <linter>: <old> -> <count>` | This linter exceeds its allowance. Fix the findings. |
+| `New lint findings. Fix them, or if they are genuinely acceptable, say why` | The failure continues on the next line: `at the call site with a //nolint comment carrying a reason.` |
+| `fallen <linter>: <old> -> <count>   (run tools/lint-ratchet.sh --update)` | Some findings are resolved. After a successful comparison, record the lower count. |
+| `cleared <linter>: <old> -> 0   (run tools/lint-ratchet.sh --update)` | The linter has no summary row. After a successful comparison, remove its allowance through `--update`. |
+| `lint ratchet holds` | Comparison succeeds. This can still include findings already allowed by the baseline. |
+| `baseline updated:` | Update succeeds; the following lines are the written counts. Review them before committing. |
 
 Four `gosec` rules are excluded with the reason stated in the file. `G115`,
 integer overflow on conversion, is the notable one: in the RF packages those
@@ -62,9 +134,91 @@ need auditing by hand rather than by rule, because a truncated sample index
 produces a plausible waterfall and slightly wrong sensitivity, which no
 automatic check distinguishes from a safe cast.
 
-**The linter version matters.** Different versions disagree about this tree by
-tens of findings, so the baseline is only meaningful against the version
-`ci.yml` pins. Use that one.
+## Every GPU kernel has a CPU twin
+
+Every WGSL compute entry point under `internal/rf/gpu/` has a CPU function
+and a comparison callback registered in `kernelTwins`, in
+`internal/rf/gpu/kernels_test.go`. Registration is per entry point, not per
+file: `coverage.wgsl:main` and `coverage.wgsl:fold` need separate entries.
+
+`TestEveryKernelHasACPUTwin` walks the source recursively, including nested
+and unembedded `.wgsl` files. It ignores line and nested block comments,
+checks every compute entry point against the registry, and checks the
+registry back against the source. This inventory check needs no GPU.
+`TestKernelTwins` checks the inventory again, then runs each registered
+callback as a named subtest, so a callback named only in prose is insufficient.
+The inventory checks registrations rather than WGSL validity or numerical
+agreement. The comparison callback supplies the assertions, and device setup
+compiles the shader and pipeline.
+
+### Register and compare a kernel
+
+1. Implement the CPU function and the WGSL entry point. The CPU reference
+   must remain usable without a GPU.
+2. Write a comparison function with signature `func(*testing.T)` in the GPU
+   package's test files. Run both implementations on the same inputs and
+   assert that their results agree within a justified tolerance. Check
+   lengths and non-finite results explicitly; terrain comparisons also
+   check that both sides agree about missing data. Existing callbacks such
+   as `compareDechirpCPU` and `compareCoverageFoldCPU` show the pattern.
+3. Add an entry to `kernelTwins` using the shader's path relative to
+   `internal/rf/gpu/`, a colon and the entry-point name. Store actual function
+   references for both the CPU implementation and the comparison.
+4. Update or remove the registration when its entry point is renamed, moved
+   or removed. A nil CPU value, a typed-nil function, a non-function or a nil
+   comparison fails the inventory check.
+5. Run the inventory and comparison tests from the MeshBench checkout.
+
+For example, the coverage entries in the registry are:
+
+```go
+"coverage.wgsl:main": {propagation.GridLossCPU, compareCoverageCPU},
+"coverage.wgsl:fold": {propagation.FoldStationCPU, compareCoverageFoldCPU},
+```
+
+The targeted test commands run from the MeshBench source checkout, with its
+Go toolchain and native build dependencies available:
+
+```bash
+go test ./internal/rf/gpu -run "^TestEveryKernelHasACPUTwin$" -count=1 -v
+go test ./internal/rf/gpu -run "^TestKernelTwins$" -count=1 -v
+```
+
+Device comparisons acquire a device through `comparisonDevice(t)`, which
+registers cleanup with the test. If device acquisition reports unavailable
+hardware, the subtest skips with `no GPU available: <reason>`. Shader or
+pipeline setup failures fail with `GPU kernel setup failed: <reason>`;
+comparison and readback errors fail as well. A skip supplies no evidence of
+numerical agreement: run the comparisons on a supported hardware adapter
+before claiming that agreement.
+
+The registered subtests are `coverage.wgsl:fold`, `coverage.wgsl:main`,
+`dechirp.wgsl:main`, `demod.wgsl:main` and `pairs.wgsl:main`. A parent
+`TestKernelTwins` result can say `PASS` while all five subtests say `SKIP`.
+The subtest results distinguish an inventory pass from a device comparison
+that actually runs.
+
+### Kernel inventory messages
+
+`<path>` is relative to `internal/rf/gpu/`, and `<entry>` is the WGSL function
+name. The test can report several problems together.
+
+| message | action |
+|---|---|
+| `<path>:<entry> has no registered CPU twin and comparison` | Implement both functions and register the entry point. |
+| `<path>:<entry>: CPU twin must be a non-nil function` | Replace the absent, typed-nil or non-function value with the CPU function reference. |
+| `<path>:<entry>: missing comparison test` | Register the non-nil comparison callback. |
+| `<path>:<entry>: registration has no kernel` | Correct or remove a registration whose path or entry no longer exists. |
+| `<path>:<entry>: duplicate compute entry point` | Give each compute entry point a unique name within its source file. |
+| `<path>: cannot identify every compute entry point` | Check the WGSL declarations: each compute attribute must resolve to an identifiable entry point, and each shader file must contain one. |
+| `no GPU compute entry points found; has the source moved?` | Check the source location and inventory walker; an empty scan cannot satisfy the rule. |
+
+The checks themselves have CPU-only negative fixtures. Run them with:
+
+```bash
+go test ./internal ./internal/rf/gpu \
+  -run "TestLintRatchetFailsClosed|TestKernelTwinGuard" -count=1 -v
+```
 
 ## The race detector
 
